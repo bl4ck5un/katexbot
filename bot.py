@@ -1,30 +1,29 @@
 import os
-import asyncio
 import re
 import tempfile
 import subprocess
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+import asyncio
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from pyppeteer import launch
-
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Slack tokens from environment
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 
-app = App(token=SLACK_BOT_TOKEN)
+app = AsyncApp(token=SLACK_BOT_TOKEN)
 
-# === Extract LaTeX from message ===
+browser = None  # Global browser instance
+
+# === Extract LaTeX from $$...$$ ===
 def extract_latex(text):
     match = re.search(r"\$\$(.+?)\$\$", text, re.DOTALL)
     return match.group(1).strip() if match else None
 
-# === Run KaTeX CLI to produce HTML ===
+# === Render KaTeX to HTML ===
 def katex_html(latex: str) -> str:
-    print(latex)
     result = subprocess.run(
         ["katex", "--no-throw-on-error", "--display-mode"],
         input=latex.encode(),
@@ -34,6 +33,7 @@ def katex_html(latex: str) -> str:
     )
     return result.stdout.decode()
 
+# === Wrap KaTeX HTML in HTML page ===
 def wrap_in_html(katex_html: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
@@ -59,22 +59,21 @@ def wrap_in_html(katex_html: str) -> str:
 </body>
 </html>"""
 
+# === Use persistent browser to take cropped screenshot ===
 async def html_to_png(html: str, output_path: str):
+    global browser
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
         f.write(html.encode())
         f.flush()
         html_file = f.name
 
-    browser = await launch(handleSIGINT=False, handleSIGTERM=False, handleSIGHUP=False)
+    if browser is None:
+        browser = await launch(handleSIGINT=False, handleSIGTERM=False, handleSIGHUP=False)
+
     page = await browser.newPage()
     await page.goto(f"file://{html_file}", waitUntil='networkidle0')
 
-    # Find the KaTeX container (wrap your KaTeX output in a <div id="math">)
-    element = await page.querySelector("#math")
-    if not element:
-        element = await page.querySelector("body")  # fallback
-
-    # Crop to the bounding box of the element
+    element = await page.querySelector("#math") or await page.querySelector("body")
     box = await element.boundingBox()
     await page.screenshot({
         'path': output_path,
@@ -87,19 +86,17 @@ async def html_to_png(html: str, output_path: str):
         'omitBackground': True
     })
 
-    await browser.close()
+    await page.close()
     os.unlink(html_file)
 
-def render_latex_to_png(latex: str, output_path: str = "output.png"):
+# === Combine all into async render function ===
+async def render_latex_to_png(latex: str, output_path: str = "output.png"):
     html = wrap_in_html(katex_html(latex))
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(html_to_png(html, output_path))
-    print(f"✅ Saved to {output_path}")
+    await html_to_png(html, output_path)
 
-# === Handle message ===
+# === Slack message handler ===
 @app.event("message")
-def handle_message(event, client):
+async def handle_message(event, client):
     text = event.get("text", "")
     latex = extract_latex(text)
     if not latex:
@@ -107,24 +104,25 @@ def handle_message(event, client):
 
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_png:
-            render_latex_to_png(latex, f_png.name)
-
-            # Upload to Slack as a thread reply
-            client.files_upload_v2(
+            await render_latex_to_png(latex, f_png.name)
+            await client.files_upload_v2(
                 channel=event["channel"],
                 thread_ts=event["ts"],
                 file=f_png.name,
                 filename="equation.png",
                 title="Rendered LaTeX",
             )
-
     except Exception as e:
-        client.chat_postMessage(
+        await client.chat_postMessage(
             channel=event["channel"],
             thread_ts=event["ts"],
             text=f"Error rendering LaTeX: `{e}`"
         )
 
-# === Entrypoint ===
+# === Start the async app ===
+async def main():
+    handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
+    await handler.start_async()
+
 if __name__ == "__main__":
-    SocketModeHandler(app, SLACK_APP_TOKEN).start()
+    asyncio.run(main())
