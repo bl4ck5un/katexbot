@@ -1,0 +1,13 @@
+appdirs==1.4.4
+certifi==2025.6.15
+importlib_metadata==8.7.0
+pyee==11.1.1
+pyppeteer==2.0.0
+python-dotenv==1.1.1
+slack_bolt==1.23.0
+slack_sdk==3.35.0
+tqdm==4.67.1
+typing_extensions==4.14.0
+urllib3==1.26.20
+websockets==10.4
+zipp==3.23.0
